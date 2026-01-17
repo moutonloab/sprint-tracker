@@ -579,20 +579,422 @@ export default defineConfig({
 });
 ```
 
-### 6.2 Data Import/Export for Browser
+### 6.2 Data Import/Export for Browser: Alternatives Analysis
+
+The CLI uses Node.js `fs` module for file I/O. The browser needs different approaches.
+
+#### Current CLI Export Format
 
 ```typescript
-// Replace file system with browser APIs
+interface ExportData {
+  version: string;           // "1.0"
+  exported_at: string;       // ISO timestamp
+  sprints: SprintWithGoals[]; // Nested: sprints → goals → criteria
+}
+```
+
+**Key features to preserve:**
+- Full data validation on import (reuse `validateImportData` from core)
+- Atomic import with transaction support
+- Overwrite option for existing records
+- Detailed error reporting
+
+---
+
+#### Export Alternatives
+
+| Method | Browser Support | UX Quality | Filename Control | Offline |
+|--------|-----------------|------------|------------------|---------|
+| **Blob + Download Link** | All browsers | Good | Yes | ✅ |
+| **File System Access API** | Chrome/Edge only | Excellent | Yes (picker) | ✅ |
+| **Clipboard API** | All browsers | Fair | N/A | ✅ |
+| **Cloud Storage SDK** | All browsers | Good | Varies | ❌ |
+
+##### Option A: Blob + Download Link (Recommended)
+
+**How it works:** Create a Blob from JSON, generate object URL, trigger download.
+
+```typescript
 export async function exportToFile(data: ExportData): Promise<void> {
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const json = JSON.stringify(data, null, 2);
+  const blob = new Blob([json], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
+
   const a = document.createElement('a');
   a.href = url;
-  a.download = `sprint-tracker-${new Date().toISOString().split('T')[0]}.json`;
+  a.download = `sprint-tracker-${formatDate(new Date())}.json`;
+  document.body.appendChild(a);
   a.click();
+  document.body.removeChild(a);
+
   URL.revokeObjectURL(url);
 }
 ```
+
+**Pros:**
+- Works in all browsers
+- No permissions required
+- Predictable filename
+- Works offline
+
+**Cons:**
+- No "Save As" dialog in most browsers (goes to Downloads folder)
+- User must find file in Downloads
+
+##### Option B: File System Access API
+
+**How it works:** Native file picker for save location.
+
+```typescript
+export async function exportWithPicker(data: ExportData): Promise<boolean> {
+  if (!('showSaveFilePicker' in window)) {
+    // Fallback to Blob method
+    await exportToFile(data);
+    return true;
+  }
+
+  try {
+    const handle = await window.showSaveFilePicker({
+      suggestedName: `sprint-tracker-${formatDate(new Date())}.json`,
+      types: [{
+        description: 'JSON Files',
+        accept: { 'application/json': ['.json'] }
+      }]
+    });
+
+    const writable = await handle.createWritable();
+    await writable.write(JSON.stringify(data, null, 2));
+    await writable.close();
+    return true;
+  } catch (e) {
+    if ((e as Error).name === 'AbortError') return false; // User cancelled
+    throw e;
+  }
+}
+```
+
+**Pros:**
+- Native OS file picker
+- User chooses save location
+- Better UX for power users
+
+**Cons:**
+- Chrome/Edge only (no Firefox/Safari)
+- Requires user permission
+- More complex error handling
+
+##### Option C: Clipboard API
+
+**How it works:** Copy JSON to clipboard for pasting elsewhere.
+
+```typescript
+export async function exportToClipboard(data: ExportData): Promise<void> {
+  const json = JSON.stringify(data, null, 2);
+  await navigator.clipboard.writeText(json);
+}
+```
+
+**Pros:**
+- Universal browser support
+- Quick for small exports
+- Can paste into any text editor
+
+**Cons:**
+- No file created
+- Large data may be unwieldy
+- User must paste somewhere
+
+---
+
+#### Import Alternatives
+
+| Method | Browser Support | UX Quality | Validation | Offline |
+|--------|-----------------|------------|------------|---------|
+| **File Input + FileReader** | All browsers | Good | Full | ✅ |
+| **File System Access API** | Chrome/Edge only | Excellent | Full | ✅ |
+| **Drag and Drop** | All browsers | Excellent | Full | ✅ |
+| **Clipboard Paste** | All browsers | Fair | Full | ✅ |
+
+##### Option A: File Input + FileReader (Recommended)
+
+**How it works:** Standard file input with FileReader API.
+
+```typescript
+export function createFileImporter(
+  onImport: (data: ExportData) => Promise<ImportResult>,
+  onError: (error: string) => void
+): HTMLInputElement {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.json,application/json';
+
+  input.onchange = async (e) => {
+    const file = (e.target as HTMLInputElement).files?.[0];
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text) as ExportData;
+      const result = await onImport(data);
+      // Handle result...
+    } catch (error) {
+      onError(`Failed to parse file: ${(error as Error).message}`);
+    }
+  };
+
+  return input;
+}
+
+// Usage in React component
+function ImportButton() {
+  const handleImport = async () => {
+    const input = createFileImporter(
+      async (data) => exportService.importData(data),
+      (error) => showToast({ type: 'error', message: error })
+    );
+    input.click();
+  };
+
+  return <Button onClick={handleImport}>Import Data</Button>;
+}
+```
+
+**Pros:**
+- Works in all browsers
+- Familiar file picker UX
+- Full validation before import
+- Works offline
+
+**Cons:**
+- Slightly more code than File System Access API
+- File input styling quirks
+
+##### Option B: Drag and Drop Zone
+
+**How it works:** Drop zone for file import.
+
+```typescript
+function DropZone({ onImport }: { onImport: (data: ExportData) => void }) {
+  const [isDragging, setIsDragging] = useState(false);
+
+  const handleDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+
+    const file = e.dataTransfer.files[0];
+    if (!file || !file.name.endsWith('.json')) {
+      showToast({ type: 'error', message: 'Please drop a .json file' });
+      return;
+    }
+
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text) as ExportData;
+      onImport(data);
+    } catch (error) {
+      showToast({ type: 'error', message: 'Invalid JSON file' });
+    }
+  };
+
+  return (
+    <div
+      className={cn('drop-zone', isDragging && 'drop-zone--active')}
+      onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+      onDragLeave={() => setIsDragging(false)}
+      onDrop={handleDrop}
+      role="button"
+      aria-label="Drop JSON file to import"
+    >
+      <p>Drag and drop a .json file here</p>
+      <p>or click to browse</p>
+    </div>
+  );
+}
+```
+
+**Pros:**
+- Intuitive UX
+- Visual feedback during drag
+- Can combine with file input click
+
+**Cons:**
+- Needs careful accessibility handling
+- More UI code
+
+##### Option C: Clipboard Paste
+
+**How it works:** Paste JSON from clipboard.
+
+```typescript
+async function importFromClipboard(): Promise<ExportData | null> {
+  try {
+    const text = await navigator.clipboard.readText();
+    const data = JSON.parse(text) as ExportData;
+    return data;
+  } catch {
+    return null;
+  }
+}
+```
+
+**Pros:**
+- Quick for copy-paste workflows
+- No file handling
+
+**Cons:**
+- Requires clipboard permission
+- User must copy JSON first
+- Not intuitive for file-based data
+
+---
+
+#### Recommendation: Hybrid Approach
+
+**Export Strategy:**
+1. **Primary:** Blob + Download Link (works everywhere)
+2. **Enhanced:** File System Access API when available (Chrome/Edge)
+3. **Secondary:** Clipboard copy button for quick sharing
+
+**Import Strategy:**
+1. **Primary:** File Input with FileReader
+2. **Enhanced:** Drag and Drop zone (combines with file input)
+3. **Secondary:** Clipboard paste for advanced users
+
+---
+
+#### Implementation
+
+```typescript
+// packages/web/src/services/file-service.ts
+
+import { ExportData } from '@sprint-tracker/core';
+
+const supportsFilePicker = 'showSaveFilePicker' in window;
+
+export async function exportData(data: ExportData): Promise<void> {
+  const filename = `sprint-tracker-${new Date().toISOString().split('T')[0]}.json`;
+  const json = JSON.stringify(data, null, 2);
+
+  if (supportsFilePicker) {
+    try {
+      const handle = await (window as any).showSaveFilePicker({
+        suggestedName: filename,
+        types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }]
+      });
+      const writable = await handle.createWritable();
+      await writable.write(json);
+      await writable.close();
+      return;
+    } catch (e) {
+      if ((e as Error).name === 'AbortError') return;
+      // Fall through to blob method
+    }
+  }
+
+  // Fallback: Blob download
+  const blob = new Blob([json], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+export async function importFromFile(file: File): Promise<ExportData> {
+  const text = await file.text();
+  return JSON.parse(text) as ExportData;
+}
+
+export async function copyToClipboard(data: ExportData): Promise<void> {
+  await navigator.clipboard.writeText(JSON.stringify(data, null, 2));
+}
+```
+
+---
+
+#### UI Component: Settings Page
+
+```tsx
+// packages/web/src/pages/SettingsPage.tsx
+
+function SettingsPage() {
+  const { exportService } = useServices();
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<ImportResult | null>(null);
+
+  const handleExport = async () => {
+    const data = await exportService.exportAll();
+    await exportData(data);
+    showToast({ type: 'success', message: 'Data exported successfully' });
+  };
+
+  const handleImportFile = async (file: File) => {
+    setImporting(true);
+    try {
+      const data = await importFromFile(file);
+      const result = await exportService.importData(data, { overwrite: false });
+      setImportResult(result);
+
+      if (result.errors.length === 0) {
+        showToast({
+          type: 'success',
+          message: `Imported ${result.sprints} sprints, ${result.goals} goals`
+        });
+      } else {
+        showToast({ type: 'warning', message: `Import completed with warnings` });
+      }
+    } catch (error) {
+      showToast({ type: 'error', message: `Import failed: ${error.message}` });
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  return (
+    <main>
+      <h1>Settings</h1>
+
+      <section aria-labelledby="export-heading">
+        <h2 id="export-heading">Export Data</h2>
+        <p>Download all your sprint data as a JSON file.</p>
+        <Button onClick={handleExport}>
+          Export to File
+        </Button>
+        <Button variant="secondary" onClick={() => copyToClipboard(data)}>
+          Copy to Clipboard
+        </Button>
+      </section>
+
+      <section aria-labelledby="import-heading">
+        <h2 id="import-heading">Import Data</h2>
+        <ImportDropZone onFile={handleImportFile} disabled={importing} />
+        {importResult && <ImportResultSummary result={importResult} />}
+      </section>
+    </main>
+  );
+}
+```
+
+---
+
+#### Cross-Platform Sync: CLI ↔ Browser
+
+The same JSON format works for both:
+
+```bash
+# Export from CLI, import to browser
+sprint-tracker data export --output backup.json
+# → Upload backup.json to browser app
+
+# Export from browser, import to CLI
+# → Download from browser app
+sprint-tracker data import backup.json
+```
+
+**Format compatibility is automatic** since both use the same `ExportData` structure and validation from `@sprint-tracker/core`.
 
 ---
 
