@@ -143,25 +143,245 @@ export class SprintService {
 }
 ```
 
-### 2.3 Browser Storage: IndexedDB
+### 2.3 Browser Storage Options: Deep Comparison
 
-**Why IndexedDB:**
-| Option | Capacity | Query Support | Async | Decision |
-|--------|----------|---------------|-------|----------|
-| **IndexedDB** | ~50% disk | Indexes | Yes | ✅ Primary |
-| localStorage | 5-10MB | Key-value | No | Settings only |
-| sql.js (WASM) | Unlimited | Full SQL | Yes | ❌ 500KB bundle |
+#### Current SQL Query Patterns (from codebase analysis)
 
-**IndexedDB Schema:**
+| Query Type | Example | Frequency |
+|------------|---------|-----------|
+| CRUD by ID | `SELECT * FROM sprint WHERE id = ?` | High |
+| Index lookup | `WHERE volgnummer = ?`, `WHERE sprint_id = ?` | High |
+| Range query | `WHERE startdatum <= ? AND einddatum >= ?` | Low |
+| Ordering | `ORDER BY volgnummer DESC LIMIT 1` | Medium |
+| Aggregation | `SELECT MAX(volgnummer)` | Low |
+| Existence check | `SELECT id FROM sprint WHERE id = ?` | Medium |
+
+**Notable:** No complex JOINs, subqueries, or window functions. All queries use simple indexes.
+
+---
+
+#### Option A: IndexedDB (Native)
+
+**How it works:** Browser-native key-value store with indexes and cursors.
+
+| Aspect | Details |
+|--------|---------|
+| **Bundle size** | 0 KB (native API) |
+| **Storage limit** | ~50% of disk (hundreds of MB to GB) |
+| **Persistence** | Automatic, durable |
+| **API style** | Async, event-based (or Promise-wrapped) |
+| **Query model** | Index lookups + cursor iteration |
+
+**Pros:**
+- Zero bundle overhead
+- Native browser optimization
+- Built-in persistence
+- Large storage capacity
+- Well-suited for this app's simple query patterns
+
+**Cons:**
+- Verbose API (mitigated by Dexie.js wrapper)
+- Need to rewrite SQL queries as IndexedDB operations
+- Different transaction model (auto-commit per operation)
+- Range queries require cursor iteration
+
+**Query Translation Examples:**
 ```typescript
-const DB_NAME = 'sprint-tracker';
-const DB_VERSION = 1;
+// SQL: SELECT * FROM sprint WHERE volgnummer = ?
+// IndexedDB:
+const sprint = await store.index('volgnummer').get(volgnummer);
 
-// Object stores:
-// - 'sprints' (keyPath: 'id', indexes: volgnummer, startdatum)
-// - 'goals' (keyPath: 'id', indexes: sprint_id, eigenaar)
-// - 'criteria' (keyPath: 'id', indexes: goal_id)
+// SQL: SELECT * FROM sprint WHERE startdatum <= ? AND einddatum >= ?
+// IndexedDB:
+const range = IDBKeyRange.upperBound(today);
+const cursor = store.index('startdatum').openCursor(range);
+// Filter in code: row.einddatum >= today
+
+// SQL: SELECT MAX(volgnummer) FROM sprint
+// IndexedDB:
+const cursor = store.index('volgnummer').openCursor(null, 'prev');
+const max = cursor ? cursor.value.volgnummer : null;
 ```
+
+---
+
+#### Option B: sql.js + localStorage
+
+**How it works:** SQLite compiled to WebAssembly, DB persisted to localStorage as binary.
+
+| Aspect | Details |
+|--------|---------|
+| **Bundle size** | ~500 KB gzipped (~1.5 MB uncompressed) |
+| **Storage limit** | 5-10 MB (localStorage limit) |
+| **Persistence** | Manual save/load required |
+| **API style** | Sync in-memory, async load/save |
+| **Query model** | Full SQL |
+
+**Pros:**
+- Identical SQL queries to CLI version
+- Familiar ACID transaction model
+- Single-file export (entire DB binary)
+- Complex queries easy (though not needed here)
+
+**Cons:**
+- 500 KB bundle size impact
+- 5-10 MB localStorage limit can be exceeded with large text fields
+- Manual persistence (must call save after writes)
+- Entire DB in memory
+- Risk of data loss on incomplete saves
+
+**Persistence Pattern:**
+```typescript
+// Load on startup
+const SQL = await initSqlJs({ locateFile: f => `/sql.js/${f}` });
+const saved = localStorage.getItem('sprint-tracker-db');
+const db = saved ? new SQL.Database(base64ToUint8Array(saved)) : new SQL.Database();
+
+// Save after each write
+function saveDb() {
+  const data = db.export();
+  localStorage.setItem('sprint-tracker-db', uint8ArrayToBase64(data));
+}
+```
+
+---
+
+#### Option C: sql.js + IndexedDB (Hybrid)
+
+**How it works:** SQLite in WASM, but persist the DB file to IndexedDB instead of localStorage.
+
+| Aspect | Details |
+|--------|---------|
+| **Bundle size** | ~500 KB gzipped |
+| **Storage limit** | ~50% of disk (IndexedDB) |
+| **Persistence** | Manual save to IndexedDB |
+| **API style** | Sync queries, async persistence |
+| **Query model** | Full SQL |
+
+**Pros:**
+- SQL queries preserved
+- No localStorage size limit
+- Familiar model for SQLite users
+
+**Cons:**
+- Still 500 KB bundle overhead
+- Still requires manual persistence
+- Entire DB loaded into memory on startup
+- More complex initialization
+
+---
+
+#### Recommendation Matrix
+
+| Factor | IndexedDB | sql.js + localStorage | sql.js + IndexedDB |
+|--------|-----------|----------------------|-------------------|
+| Bundle size | ✅ 0 KB | ❌ 500 KB | ❌ 500 KB |
+| Storage capacity | ✅ Large | ❌ 5-10 MB | ✅ Large |
+| Query reuse | ❌ Rewrite | ✅ Same SQL | ✅ Same SQL |
+| Auto-persistence | ✅ Yes | ❌ Manual | ❌ Manual |
+| Startup time | ✅ Fast | ⚠️ Medium | ⚠️ Medium |
+| Memory usage | ✅ On-demand | ❌ Full DB | ❌ Full DB |
+| Data safety | ✅ Native | ⚠️ Save risk | ⚠️ Save risk |
+
+---
+
+#### Decision: IndexedDB (with Dexie.js)
+
+**Primary choice: IndexedDB** wrapped with [Dexie.js](https://dexie.org/) for ergonomic API.
+
+**Rationale:**
+1. **Query complexity is low** - All current queries translate efficiently to IndexedDB indexes
+2. **Bundle size matters** - 500 KB is significant for a lightweight app
+3. **Data safety** - Native persistence eliminates manual save bugs
+4. **Future-proof** - Native APIs improve over time
+
+**When to reconsider sql.js:**
+- If complex reporting queries are added (aggregations, JOINs across entities)
+- If data export must be SQLite-compatible binary format
+- If team strongly prefers SQL over IndexedDB patterns
+
+---
+
+#### Implementation with Dexie.js
+
+```typescript
+// packages/web/src/db/dexie-storage.ts
+import Dexie, { Table } from 'dexie';
+import { Sprint, Goal, SuccessCriterion } from '@sprint-tracker/core';
+
+class SprintTrackerDB extends Dexie {
+  sprints!: Table<Sprint, string>;
+  goals!: Table<Goal, string>;
+  criteria!: Table<SuccessCriterion, string>;
+
+  constructor() {
+    super('sprint-tracker');
+    this.version(1).stores({
+      sprints: 'id, volgnummer, startdatum, einddatum',
+      goals: 'id, sprint_id, eigenaar, aangemaakt_op',
+      criteria: 'id, goal_id'
+    });
+  }
+}
+
+export class DexieStorage implements StorageAdapter {
+  private db = new SprintTrackerDB();
+
+  async initialize(): Promise<void> {
+    await this.db.open();
+  }
+
+  async getSprintById(id: string): Promise<Sprint | null> {
+    return await this.db.sprints.get(id) ?? null;
+  }
+
+  async getSprintByVolgnummer(volgnummer: number): Promise<Sprint | null> {
+    return await this.db.sprints.where('volgnummer').equals(volgnummer).first() ?? null;
+  }
+
+  async getCurrentSprint(today: string): Promise<Sprint | null> {
+    // Range query: startdatum <= today AND einddatum >= today
+    return await this.db.sprints
+      .where('startdatum').belowOrEqual(today)
+      .filter(s => s.einddatum >= today)
+      .reverse()
+      .first() ?? null;
+  }
+
+  async getMaxVolgnummer(): Promise<number | null> {
+    const last = await this.db.sprints.orderBy('volgnummer').reverse().first();
+    return last?.volgnummer ?? null;
+  }
+
+  async getAllSprints(): Promise<Sprint[]> {
+    return await this.db.sprints.orderBy('volgnummer').toArray();
+  }
+
+  async createSprint(sprint: Sprint): Promise<void> {
+    await this.db.sprints.add(sprint);
+  }
+
+  async deleteSprint(id: string): Promise<boolean> {
+    // Cascade delete goals and criteria
+    await this.db.transaction('rw', [this.db.sprints, this.db.goals, this.db.criteria], async () => {
+      const goalIds = await this.db.goals.where('sprint_id').equals(id).primaryKeys();
+      await this.db.criteria.where('goal_id').anyOf(goalIds).delete();
+      await this.db.goals.where('sprint_id').equals(id).delete();
+      await this.db.sprints.delete(id);
+    });
+    return true;
+  }
+
+  // ... other methods follow same pattern
+}
+```
+
+**Dexie.js benefits:**
+- 25 KB gzipped (vs 500 KB for sql.js)
+- Promise-based API
+- Type-safe with TypeScript
+- Handles IndexedDB quirks across browsers
+- Built-in transaction support
 
 ---
 
@@ -421,10 +641,11 @@ export async function exportToFile(data: ExportData): Promise<void> {
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| IndexedDB browser differences | High | Test Safari/Firefox/Chrome; consider Dexie.js wrapper |
-| Bundle size bloat | Medium | Tree-shaking, code splitting, bundle analysis |
+| IndexedDB browser differences | High | **Dexie.js handles cross-browser quirks**; test Safari/Firefox/Chrome |
+| Bundle size bloat | Medium | Tree-shaking, code splitting, bundle analysis (Dexie.js only adds 25KB) |
 | Breaking CLI during refactor | High | Maintain test coverage, staged rollout |
 | Accessibility regressions | Medium | Automated a11y tests, manual testing |
+| Future need for complex queries | Low | StorageAdapter interface allows swapping to sql.js later if needed |
 
 ---
 
