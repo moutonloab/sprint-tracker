@@ -390,7 +390,6 @@ function runMigrationV1(db: Database.Database): void {
 export function createTestStorage(): SQLiteStorage {
   const storage = new (class extends SQLiteStorage {
     constructor() {
-      // @ts-expect-error - accessing private for test
       super(':memory:');
     }
   })();
